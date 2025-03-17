@@ -9,53 +9,96 @@ from datetime import datetime
 
 # Configuration
 UAH_TO_IDR = 380  # 1 UAH = 380 IDR (approximate)
-DEFAULT_PAGES = 100  # Number of pages to fetch from Steam (10 games per page)
+DEFAULT_PAGES = 20  # Number of pages to fetch from Steam (50 games per page)
 
-def get_steam_games(max_pages: int = DEFAULT_PAGES) -> List[Dict]:
+def get_steam_games(max_pages: int = DEFAULT_PAGES, max_retries: int = 3) -> List[Dict]:
     games = []
     
     try:
         print("\nStarting Steam game search...")
         headers = {
-            'User-Agent': 'Mozilla/5.0',
-            'Accept': 'application/json'
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+            'Accept': 'text/javascript, text/html, application/xml, text/xml, */*',
+            'Accept-Language': 'en',
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-Prototype-Version': '1.7'
         }
         
-        # Steam search API
-        search_url = "https://store.steampowered.com/api/storesearch"
+        # Steam search endpoint
+        search_url = "https://store.steampowered.com/search/results"
         
         for page in range(max_pages):
+            # Add longer delay between pages
+            if page > 0:
+                sleep_time = 3
+                print(f"Waiting {sleep_time}s before fetching next page...")
+                time.sleep(sleep_time)
+                
             print(f"\nFetching page {page + 1}...")
             
-            response = requests.get(
-                search_url,
-                headers=headers,
-                params={
-                    'cc': 'ua',
-                    'l': 'english',
-                    'start': page * 50,  # Each page has 50 items
-                    'sort_by': '_ASC',  # Default sorting
-                    'term': '',  # Empty term to get all games
-                    'category1': '998'  # Filter for games only
-                }
-            )
+            # Try multiple times with exponential backoff
+            for attempt in range(max_retries):
+                if attempt > 0:
+                    sleep_time = min(2 ** attempt, 16)  # Cap at 16 seconds
+                    print(f"Retrying page {page + 1} after {sleep_time}s... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(sleep_time)
+                
+                response = requests.get(
+                    search_url,
+                    headers=headers,
+                    params={
+                        'force_infinite': '1',
+                        'supportedlang': 'english',
+                        'ndl': '1',
+                        'json': '1',
+                        'category1': '998',  # Games category
+                        'specials': '1',    # Games with discounts
+                        'start': page * 50,
+                        'count': 50,
+                        'cc': 'ua',
+                        'l': 'english',
+                        'sort_by': '_ASC',   # Sort by relevance/popularity
+                    }
+                )
+                
+                if response.status_code == 429:  # Rate limited
+                    if attempt == max_retries - 1:
+                        print(f"Rate limited when fetching page {page + 1}")
+                        return games
+                    continue
             
-            if response.status_code == 200:
-                data = response.json()
-                items = data.get('items', [])
-                
-                if not items:
-                    print("No more games found.")
+                if response.status_code == 200:
+                    data = response.json()
+                    items = data.get('items', [])
+                    
+                    if not items:
+                        print("No more games found.")
+                        return games
+                    
+                    print(f"\nGames on page {page + 1}:")
+                    for item in items:
+                        name = item.get('name')
+                        logo_url = item.get('logo', '')
+                        
+                        # Extract appid from logo URL
+                        # Format: https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2543990/...
+                        import re
+                        appid_match = re.search(r'/apps/([0-9]+)/', logo_url)
+                        appid = appid_match.group(1) if appid_match else None
+                        
+                        if appid and name:
+                            print(f"- {name} (ID: {appid})")
+                            games.append({
+                                'appid': str(appid),
+                                'name': name
+                            })
+                    
+                    # Success, move to next page
                     break
-                
-                print(f"Found {len(items)} games on page {page + 1}")
-                games.extend([{
-                    'appid': str(item['id']),
-                    'name': item.get('name', '')
-                } for item in items if item.get('id') and item.get('name')])
-                
-                # Steam has rate limiting, so let's be nice
-                time.sleep(1)
+                elif response.status_code != 429:  # If not rate limited, show error
+                    print(f"HTTP {response.status_code} when fetching page {page + 1}")
+                    if attempt == max_retries - 1:
+                        return games
             else:
                 print(f"Error fetching page {page + 1}: {response.text}")
                 break
@@ -66,29 +109,64 @@ def get_steam_games(max_pages: int = DEFAULT_PAGES) -> List[Dict]:
     print(f"Total unique games found: {len(games)}")
     return games
 
-def get_game_details(app_id: str, region: str) -> Optional[Dict]:
+def get_game_details(app_id: str, region: str, max_retries: int = 5) -> Optional[Dict]:
     url = f"https://store.steampowered.com/api/appdetails?appids={app_id}&cc={region}"
-    try:
-        response = requests.get(url)
-        if response.status_code == 200:
-            data = response.json()
-            if data and data.get(app_id, {}).get("success"):
-                return data[app_id]["data"]
-        time.sleep(1)  # Rate limiting
-    except Exception as e:
-        print(f"Error fetching {app_id} for region {region}: {e}")
+    
+    for attempt in range(max_retries):
+        try:
+            if attempt > 0:
+                sleep_time = min(2 ** attempt, 16)  # Cap at 16 seconds
+                print(f"Retrying {app_id} after {sleep_time}s... (attempt {attempt + 1}/{max_retries})")
+                time.sleep(sleep_time)
+            
+            response = requests.get(url)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if not data:
+                    print(f"No data for {app_id}")
+                    return None
+                
+                app_data = data.get(app_id, {})
+                if not app_data.get("success"):
+                    print(f"Unsuccessful response for {app_id}")
+                    return None
+                    
+                # Add delay after successful request
+                time.sleep(3)
+                return app_data["data"]
+                
+            elif response.status_code == 429:  # Too Many Requests
+                if attempt == max_retries - 1:
+                    print(f"Rate limited for {app_id} after {max_retries} retries")
+                continue
+            else:
+                print(f"HTTP {response.status_code} for {app_id}")
+                if attempt < max_retries - 1:
+                    continue
+                return None
+                
+        except Exception as e:
+            print(f"Error for {app_id}: {e}")
+            if attempt < max_retries - 1:
+                continue
+            return None
+            
     return None
 
 def get_price_info(game_data: Dict, region: str) -> Optional[Dict]:
     try:
-        price_overview = game_data.get("price_overview", {})
-        if price_overview:
-            return {
-                'currency': price_overview.get('currency'),
-                'initial': price_overview.get('initial', 0) / 100,  # Convert to actual currency
-                'final': price_overview.get('final', 0) / 100,
-                'discount_percent': price_overview.get('discount_percent', 0)
-            }
+        price_overview = game_data.get("price_overview")
+        if not price_overview:
+            # Game might be free, unreleased, or not available in region
+            return None
+            
+        return {
+            'currency': price_overview.get('currency'),
+            'initial': price_overview.get('initial', 0) / 100,  # Convert to actual currency
+            'final': price_overview.get('final', 0) / 100,
+            'discount_percent': price_overview.get('discount_percent', 0)
+        }
     except Exception as e:
         print(f"Error getting price info for region {region}: {e}")
     return None
@@ -108,18 +186,27 @@ def get_idr_equivalent(uah_price: float) -> float:
 def compare_prices(app_id: str) -> Optional[Dict]:
     """Compare prices between UA and ID regions"""
     try:
-        # Get game details for both regions
+        # Get game details for both regions with delay between requests
         ua_details = get_game_details(app_id, "ua")
-        id_details = get_game_details(app_id, "id")
+        if not ua_details:
+            return None
+            
+        # Add extra delay between regions
+        time.sleep(3)
         
-        if not ua_details or not id_details:
+        id_details = get_game_details(app_id, "id")
+        if not id_details:
             return None
             
         # Get price info
         ua_price = get_price_info(ua_details, "ua")
         id_price = get_price_info(id_details, "id")
         
-        if not ua_price or not id_price:
+        if not ua_price:
+            print(f"No UA price data for {app_id}")
+            return None
+        if not id_price:
+            print(f"No ID price data for {app_id}")
             return None
             
         # Convert UA price to IDR for comparison
@@ -144,14 +231,31 @@ def main(pages: int = DEFAULT_PAGES):
     print("Fetching Steam games list...")
     games = get_steam_games(pages)
     
+    # Deduplicate games by appid
+    unique_games = {}
+    for game in games:
+        unique_games[game['appid']] = game
+    games = list(unique_games.values())
+    
+    total_games = len(games)
+    print(f"\nStarting price comparison for {total_games} unique games...")
+    
     # Compare prices for each game
     price_comparisons = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    completed = 0
+    
+    # Reduce concurrent workers to avoid rate limits
+    with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(compare_prices, game['appid']) for game in games]
-        for future in futures:
+        for future, game in zip(futures, games):
+            completed += 1
+            print(f"Processing {completed}/{total_games}: {game['name']}", end="")
             result = future.result()
             if result:
                 price_comparisons.append(result)
+                print(f" - ✓ Found prices")
+            else:
+                print(" - ✗ No price data")
     
     # Sort by price difference (highest first)
     price_comparisons.sort(key=lambda x: x['difference'], reverse=True)
